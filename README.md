@@ -39,22 +39,15 @@ Add the MCP servers you want to `server/mcp-registry.json`. You can add up to **
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://mcp.notion.com/sse"]
     },
-    "linear": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.linear.app/sse"]
-    },
-    "hyperbrowser": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "hyperbrowser-mcp"
-      ],
-      "env": {
-        "HYPERBROWSER_API_KEY": "API_KEY_HERE"
-      }
+    "openharness": {
+      "url": "http://openharness-mcp:8940/mcp",
+      "description": "OpenHarness agent execution, Qwen3.8-27B coding tools, vector memory, and job tracking"
     }
+  }
 }
 ```
+
+> **Note:** Entries in `mcp-registry.json` are only a catalog of servers available to add. A server is only actually connected once it (or its equivalent) is added to `server/config.json`, which holds the active/live connections loaded by the router at startup. Remote servers like `notion` also require you to complete their OAuth flow via `npm run setup-registry` before they'll connect.
 
 ### Step 2: Configure Router Cache Size
 
@@ -265,10 +258,6 @@ Add your desired MCP servers to `server/mcp-registry.json`:
 ```json
 {
   "mcpServers": {
-    "notion": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.notion.com/sse"]
-    },
     "github": {
       "command": "npx", 
       "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -279,6 +268,8 @@ Add your desired MCP servers to `server/mcp-registry.json`:
   }
 }
 ```
+
+> Servers listed here are only connected once they appear in `server/config.json` (the active/live configuration). Adding an entry to the registry alone does not connect it.
 
 ### Step 3: Production Deployment
 

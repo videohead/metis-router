@@ -1,0 +1,12 @@
+services:
+  traefik:
+    image: traefik:v2.11.31
+    container_name: traefik
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./acme.json:/acme.json
+    environment:
+      TZ: UTC

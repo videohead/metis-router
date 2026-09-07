@@ -235,7 +235,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         (error) => {
           console.error('❌ Stream error:', error);
           get().updateMessage(assistantMessageId, {
-            content: 'Sorry, I encountered an error processing your request.',
+            content: `Sorry, I could not complete your request. ${error || 'The response stream ended unexpectedly.'}`,
             isStreaming: false,
             streamingComplete: true
           });
@@ -246,8 +246,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return true;
     } catch (error) {
       console.error('❌ Send message error:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       get().updateMessage(assistantMessageId, {
-        content: 'Sorry, I encountered an error sending your message.',
+        content: `Sorry, I could not send your message. ${errorMessage || 'The backend did not provide an error message.'}`,
         isStreaming: false,
         streamingComplete: true
       });

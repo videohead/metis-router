@@ -1,22 +1,8 @@
 {
   "mcpServers": {
-    "notion": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.notion.com/sse"]
-    },
-    "linear": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.linear.app/sse"]
-    },
-    "hyperbrowser": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "hyperbrowser-mcp"
-      ],
-      "env": {
-        "HYPERBROWSER_API_KEY": "API_KEY_HERE"
-      }
+    "openharness": {
+      "url": "http://openharness-mcp:8940/mcp",
+      "description": "OpenHarness agent execution, Qwen3.8-27B coding tools, vector memory, and job tracking"
     }
   }
-} 
+}

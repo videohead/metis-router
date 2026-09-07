@@ -17,8 +17,8 @@ import {
   CompatibilityCallToolResultSchema,
   GetPromptResultSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { createClients, ConnectedClient } from './client.js';
-import { Config, loadConfig } from './config.js';
+import { createClients, ConnectedClient, ConnectionHooks } from './client.js';
+import { Config, loadConfig, ServerConfig } from './config.js';
 import { z } from 'zod';
 import EventSource from 'eventsource';
 import { addNewMcp, AddMCPResult, heatUpMcpServer } from './add-new-mcp.js';
@@ -53,11 +53,103 @@ export const createServer = async () => {
     }
   }
 
+  const toolToClientMap = new Map<string, ConnectedClient>();
+  const resourceToClientMap = new Map<string, ConnectedClient>();
+  const promptToClientMap = new Map<string, ConnectedClient>();
+
+  // Deterministic routing: every routed name is namespaced as "server:name".
+  // Strip any existing "[server] " prefix so double-listing doesn't compound it.
+  const stripPrefix = (desc: string | undefined) => (desc || '').replace(/^\[[^\]]+\]\s*/, '');
+  const ns = (server: string, name: string) => `${server}:${name}`;
+  // Register a name so both the canonical prefixed form and the bare original
+  // resolve, but never let a bare name steal an already-claimed route.
+  const registerRoute = (map: Map<string, ConnectedClient>, server: string, name: string, client: ConnectedClient) => {
+    map.set(ns(server, name), client);
+    if (!map.has(name)) map.set(name, client);
+  };
+
+  // Swap a reconnected client into the active set and invalidate cached routes.
+  const handleReconnect = async (name: string, fresh: ConnectedClient) => {
+    const idx = connectedClients.findIndex(c => c.name === name);
+    const stale = idx >= 0 ? connectedClients[idx] : undefined;
+    if (idx >= 0) connectedClients[idx] = fresh; else connectedClients.push(fresh);
+    if (stale) { try { await stale.cleanup(); } catch { } }
+    toolToClientMap.clear();
+    resourceToClientMap.clear();
+    promptToClientMap.clear();
+    mcpLog(`Rebuilt routing after reconnect of ${name}`);
+    notifyToolListChanged();
+  };
+
+  // Build a fresh client+transport for a single server (used by reconnect paths).
+  const connectOne = async (server: ServerConfig, hooks: ConnectionHooks): Promise<ConnectedClient> => {
+    const [fresh] = await createClients([server], hooks);
+    if (!fresh) throw new Error(`connect failed for ${server.name}`);
+    return fresh;
+  };
+
+  // Reconnect one upstream by name (e.g. after its MCP session expired on restart).
+  // Retries briefly to ride out the upstream's own restart window. Guarded so
+  // concurrent triggers (probe + onclose + call-path) don't stack reconnects.
+  const reconnectingServers = new Set<string>();
+  const reconnectServer = async (name: string, attempts = 5): Promise<boolean> => {
+    if (reconnectingServers.has(name)) return false;
+    reconnectingServers.add(name);
+    try {
+      const serverConfig = config.servers.find((s: any) => s.name === name);
+      if (!serverConfig) return false;
+      for (let i = 1; i <= attempts; i++) {
+        try {
+          const fresh = await connectOne(serverConfig, { onReconnect: handleReconnect });
+          await handleReconnect(name, fresh);
+          mcpLog(`Reconnected to ${name} on demand (attempt ${i})`);
+          return true;
+        } catch (err) {
+          console.error(`On-demand reconnect to ${name} attempt ${i}/${attempts} failed:`, err);
+          await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (i - 1), 8000)));
+        }
+      }
+      return false;
+    } finally {
+      reconnectingServers.delete(name);
+    }
+  };
+
+  // True when an error indicates the upstream session/connection is dead and a
+  // reconnect (not just a retry) is required.
+  const isConnectionError = (error: any) =>
+    error?.code === -32000 ||
+    /session not found|connection closed|terminated|fetch failed/i.test(String(error?.message ?? ''));
+
   // Load configuration and connect to servers
   let config = loadConfig();
-  
-  let connectedClients = await createClients(config.servers);
+
+  let connectedClients = await createClients(config.servers, { onReconnect: handleReconnect });
   mcpLog(`Connected to ${connectedClients.length} servers`);
+
+  // Periodic health probe: for HTTP/SSE upstreams, a dead MCP session (e.g. the
+  // upstream restarted) never fires transport.onclose — it only surfaces as a
+  // 404 on the next request. Probe each HTTP/SSE upstream with a lightweight
+  // ping and reconnect any whose session has died, so tools self-heal.
+  const HEALTH_INTERVAL_MS = 15000;
+  const healthProbe = setInterval(async () => {
+    for (const cc of connectedClients) {
+      if (reconnectingServers.has(cc.name)) continue; // already being reconnected
+      const serverCfg = config.servers.find((s: any) => s.name === cc.name);
+      const t = serverCfg?.transport?.type;
+      if (t !== 'streamable-http' && t !== 'sse') continue; // stdio has its own lifecycle
+      try {
+        await cc.client.request({ method: 'ping', params: {} }, z.object({}).passthrough());
+      } catch (err: any) {
+        // ping unsupported is fine (server alive); only reconnect on a dead session/connection
+        if (isConnectionError(err)) {
+          console.warn(`Health probe: ${cc.name} session dead (${err?.message}), reconnecting...`);
+          await reconnectServer(cc.name);
+        }
+      }
+    }
+  }, HEALTH_INTERVAL_MS);
+  healthProbe.unref?.();
 
   // Function to reload MCP server connections
   async function reloadServerConnections() {
@@ -65,10 +157,10 @@ export const createServer = async () => {
     
     // Clean up existing connections
     await Promise.all(connectedClients.map(({ cleanup }) => cleanup()));
-    
+
     // Reload config and create new connections
     config = loadConfig();
-    connectedClients = await createClients(config.servers);
+    connectedClients = await createClients(config.servers, { onReconnect: handleReconnect });
     
     // Clear the maps since the clients have changed
     toolToClientMap.clear();
@@ -102,11 +194,7 @@ export const createServer = async () => {
     }
   });
 
-  // Maps to track which client owns which resource
-  const toolToClientMap = new Map<string, ConnectedClient>();
-  const resourceToClientMap = new Map<string, ConnectedClient>();
-  const promptToClientMap = new Map<string, ConnectedClient>();
-
+  // Maps (declared above) track which client owns which tool/prompt/resource.
   const server = new Server(
     {
       name: "metis",
@@ -140,16 +228,38 @@ export const createServer = async () => {
 
         if (result.tools) {
           const toolsWithSource = result.tools.map((tool: Tool) => {
-            toolToClientMap.set(tool.name, connectedClient);
+            registerRoute(toolToClientMap, connectedClient.name, tool.name, connectedClient);
             return {
               ...tool,
-              description: `[${connectedClient.name}] ${tool.description || ''}`
+              name: ns(connectedClient.name, tool.name),
+              description: `[${connectedClient.name}] ${stripPrefix(tool.description)}`
             };
           });
           allTools.push(...toolsWithSource);
         }
       } catch (error) {
         console.error(`Error fetching tools from ${connectedClient.name}:`, error);
+        // Self-heal: a dead session/connection shouldn't permanently drop this
+        // server's tools from the gateway. Reconnect and retry once inline.
+        if (isConnectionError(error)) {
+          const healed = await reconnectServer(connectedClient.name, 2);
+          if (healed) {
+            const fresh = connectedClients.find(c => c.name === connectedClient.name);
+            if (fresh) {
+              try {
+                const retry = await fresh.client.request({ method: 'tools/list', params: { _meta: request.params?._meta } }, ListToolsResultSchema);
+                if (retry.tools) {
+                  for (const tool of retry.tools) {
+                    registerRoute(toolToClientMap, fresh.name, tool.name, fresh);
+                    allTools.push({ ...tool, name: ns(fresh.name, tool.name), description: `[${fresh.name}] ${stripPrefix(tool.description)}` });
+                  }
+                }
+              } catch (e) {
+                console.error(`Retry tools/list failed for ${fresh.name}:`, e);
+              }
+            }
+          }
+        }
       }
     }
 
@@ -261,7 +371,7 @@ export const createServer = async () => {
               
               if (toolsResult.tools) {
                 toolsResult.tools.forEach((tool: Tool) => {
-                  toolToClientMap.set(tool.name, connectedClient);
+                  registerRoute(toolToClientMap, connectedClient.name, tool.name, connectedClient);
                 });
                 console.log(`Added ${toolsResult.tools.length} tools from ${connectedClient.name}: ${toolsResult.tools.map(t => t.name).join(', ')}`);
               }
@@ -375,7 +485,9 @@ export const createServer = async () => {
       }
     }
 
+    // Resolve "server:tool" (canonical) or a bare name; forward the bare tool name upstream.
     const clientForTool = toolToClientMap.get(name);
+    const upstreamToolName = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
 
     if (!clientForTool) {
       throw new Error(`Unknown tool: ${name}`);
@@ -391,18 +503,20 @@ export const createServer = async () => {
     }
     // <<< END OF HEATING LOGIC >>>
 
-    // Retry logic for tool calls
-    const maxRetries = 2;
+    // Retry logic for tool calls. On a dead session/connection, reconnect the
+    // upstream first, then re-resolve the (possibly new) client before retrying.
+    const maxRetries = 3;
     let lastError: any;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const currentClient = toolToClientMap.get(name) ?? clientForTool;
       try {
         // Use the correct schema for tool calls
-        return await clientForTool.client.request(
+        return await currentClient.client.request(
           {
             method: 'tools/call',
             params: {
-              name,
+              name: upstreamToolName,
               arguments: args || {},
               _meta: {
                 progressToken: request.params._meta?.progressToken
@@ -413,37 +527,19 @@ export const createServer = async () => {
         );
       } catch (error: any) {
         lastError = error;
-        
-        // Check if it's a connection closed error
-        if (error?.code === -32000 && error?.message?.includes('Connection closed')) {
-          console.log(`Connection closed error for ${clientForTool.name}, attempt ${attempt + 1}/${maxRetries + 1}`);
-          
-          if (attempt < maxRetries) {
-            // Wait a bit before retrying
-            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
-            
-            // Try to reconnect the client if possible
-            try {
-              console.log(`Attempting to reconnect ${clientForTool.name}...`);
-              // Force a reload of just this client's connection
-              const serverConfig = config.servers.find((s: any) => s.name === clientForTool.name);
-              if (serverConfig) {
-                // This will be handled by the next tool list request which will recreate the connection
-                console.log(`Will reconnect ${clientForTool.name} on next request`);
-              }
-            } catch (reconnectError) {
-              console.error(`Failed to reconnect ${clientForTool.name}:`, reconnectError);
-            }
-            continue;
-          }
+
+        if (isConnectionError(error) && attempt < maxRetries) {
+          console.log(`Connection/session error for ${clientForTool.name}, reconnecting (attempt ${attempt + 1}/${maxRetries + 1})...`);
+          await reconnectServer(clientForTool.name);
+          continue; // loop re-resolves toolToClientMap to the fresh client
         }
-        
-        // If it's not a connection error or we've exhausted retries, throw the error
+
+        // Not a connection error or retries exhausted: surface it.
         console.error(`Error calling tool through ${clientForTool.name}:`, error);
         throw error;
       }
     }
-    
+
     // This should never be reached, but just in case
     throw lastError;
   });
@@ -452,6 +548,7 @@ export const createServer = async () => {
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const { name } = request.params;
     const clientForPrompt = promptToClientMap.get(name);
+    const upstreamPromptName = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
 
     if (!clientForPrompt) {
       throw new Error(`Unknown prompt: ${name}`);
@@ -465,7 +562,7 @@ export const createServer = async () => {
         {
           method: 'prompts/get' as const,
           params: {
-            name,
+            name: upstreamPromptName,
             arguments: request.params.arguments || {},
             _meta: request.params._meta || {
               progressToken: undefined
@@ -511,10 +608,11 @@ export const createServer = async () => {
 
         if (result.prompts) {
           const promptsWithSource = result.prompts.map((prompt: any) => {
-            promptToClientMap.set(prompt.name, connectedClient);
+            registerRoute(promptToClientMap, connectedClient.name, prompt.name, connectedClient);
             return {
               ...prompt,
-              description: `[${connectedClient.name}] ${prompt.description || ''}`
+              name: ns(connectedClient.name, prompt.name),
+              description: `[${connectedClient.name}] ${stripPrefix(prompt.description)}`
             };
           });
           allPrompts.push(...promptsWithSource);
@@ -554,9 +652,10 @@ export const createServer = async () => {
 
         if (result.resources) {
           const resourcesWithSource = result.resources.map((resource: any) => {
-            resourceToClientMap.set(resource.uri, connectedClient);
+            registerRoute(resourceToClientMap, connectedClient.name, resource.uri, connectedClient);
             return {
               ...resource,
+              uri: ns(connectedClient.name, resource.uri),
               name: `[${connectedClient.name}] ${resource.name || ''}`
             };
           });
@@ -577,6 +676,7 @@ export const createServer = async () => {
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     const clientForResource = resourceToClientMap.get(uri);
+    const upstreamUri = uri.includes(':') ? uri.slice(uri.indexOf(':') + 1) : uri;
 
     if (!clientForResource) {
       throw new Error(`Unknown resource: ${uri}`);
@@ -587,7 +687,7 @@ export const createServer = async () => {
         {
           method: 'resources/read',
           params: {
-            uri,
+            uri: upstreamUri,
             _meta: request.params._meta
           }
         },

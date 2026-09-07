@@ -103,6 +103,8 @@ SERVER_URL=http://localhost:9999  # or http://server:9999 in Docker
 BACKEND_PORT=8000
 PYTHON_ENV=development
 OPENAI_MODEL=gpt-4o
+DEFAULT_CHAT_MODEL_CONNECTION=default
+CHAT_MODEL_CONNECTIONS={"default":{"label":"GPT-4o","model":"gpt-4o"},"fast":{"label":"GPT-4o mini","model":"gpt-4o-mini"},"qwen":{"label":"Qwen3.8","model":"unsloth/Qwen3.8-27B-NVFP4","base_url":"http://10.0.0.250:11434/v1","api_key":"not-needed"}}
 
 # Session management
 SESSION_TIMEOUT_MINUTES=30
@@ -119,6 +121,7 @@ CORS_ORIGINS=http://localhost:3000
 - `POST /connect` - Initialize new AI agent session
 - `DELETE /sessions/{session_id}` - Cleanup session resources
 - `GET /sessions/{session_id}/status` - Get session metadata
+- `GET /model-connections` - List configured chat model connections
 
 ### Conversation
 
@@ -136,7 +139,7 @@ CORS_ORIGINS=http://localhost:3000
 # Initialize session
 curl -X POST http://localhost:8000/connect \
   -H "Content-Type: application/json" \
-  -d '{"chat_history": []}'
+  -d '{"chat_history": [], "model_connection": "fast"}'
 
 # Send message
 curl -X POST http://localhost:8000/sessions/{session_id}/message \

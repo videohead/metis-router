@@ -17,6 +17,16 @@ export interface ConnectedClient {
   name: string;
 }
 
+/**
+ * Callbacks the router registers on every connected upstream so dropped
+ * connections are re-established instead of silently dropping the server's
+ * tools from the gateway.
+ */
+export interface ConnectionHooks {
+  onReconnect?: (name: string, client: ConnectedClient) => void | Promise<void>;
+  onDisconnect?: (name: string) => void | Promise<void>;
+}
+
 function mcpLog(message: string) {
   console.log(JSON.stringify({
     jsonrpc: "2.0",
@@ -38,7 +48,14 @@ const createClient = (server: ServerConfig): { client: Client | undefined, trans
       if (!server.transport.url) {
         throw new Error('URL must be provided for streamable-http transport');
       }
-      transport = new StreamableHTTPClientTransport(new URL(server.transport.url));
+      const headers = { ...(server.transport.headers || {}) };
+      if (server.transport.basicAuth) {
+        const password = server.transport.basicAuth.password.replace(/\s+/g, '');
+        headers.Authorization = `Basic ${Buffer.from(`${server.transport.basicAuth.username}:${password}`).toString('base64')}`;
+      }
+      transport = new StreamableHTTPClientTransport(new URL(server.transport.url), {
+        requestInit: Object.keys(headers).length > 0 ? { headers } : undefined
+      });
     } else {
       // For stdio transport
       const serverEnv: Record<string, string> = {};
@@ -79,7 +96,10 @@ const createClient = (server: ServerConfig): { client: Client | undefined, trans
   }
 }
 
-export const createClients = async (servers: ServerConfig[]): Promise<ConnectedClient[]> => {
+export const createClients = async (
+  servers: ServerConfig[],
+  hooks: ConnectionHooks = {}
+): Promise<ConnectedClient[]> => {
   const clients: ConnectedClient[] = [];
 
   for (const server of servers) {
@@ -101,9 +121,15 @@ export const createClients = async (servers: ServerConfig[]): Promise<ConnectedC
         await client.connect(transport);
         mcpLog(`Connected to server: ${server.name}`);
 
-        // Add error handling for connection drops
+        // Intentional-close flag: set by cleanup() so onclose can distinguish a
+        // deliberate teardown (reload/reconnect swap) from a genuine drop. The
+        // periodic health probe in mcp-proxy owns reconnection, so onclose only
+        // notifies — it must NOT reconnect here or it loops on intentional closes.
+        let intentionallyClosed = false;
         transport.onclose = () => {
+          if (intentionallyClosed) return;
           console.warn(`Connection to ${server.name} was closed unexpectedly`);
+          void hooks.onDisconnect?.(server.name);
         };
 
         transport.onerror = (error: any) => {
@@ -114,6 +140,7 @@ export const createClients = async (servers: ServerConfig[]): Promise<ConnectedC
           client,
           name: server.name,
           cleanup: async () => {
+            intentionallyClosed = true;
             try {
               await transport.close();
             } catch (error) {

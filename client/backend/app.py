@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 
 # Load environment variables from root .env file
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -23,9 +24,10 @@ load_dotenv(dotenv_path=str(env_path))
 from collections import defaultdict
 from typing import cast
 
-from agents import Agent, ModelSettings, Runner
+from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, Runner
 from agents.items import ToolCallOutputItem
 from agents.mcp import MCPServerStdio
+from openai import AsyncOpenAI
 from openai.types.responses import (
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
@@ -119,6 +121,10 @@ CLEANUP_INTERVAL_SECONDS = int(
 
 BASE_INSTRUCTIONS = METIS_SYSTEM_PROMPT
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_CLIENT = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 
 
 def create_agent_instructions(chat_history: List[Dict[str, str]]) -> str:
@@ -191,6 +197,48 @@ async def startup_event():
     asyncio.create_task(cleanup_expired_sessions())
 
 
+def build_metis_mcp_server(session_id: str) -> MCPServerStdio:
+    server_url = os.getenv("SERVER_URL", "http://localhost:9999")
+    return MCPServerStdio(
+        name=f"metis-{session_id}",
+        params={
+            "command": "npx",
+            "args": ["-y", "mcp-remote", f"{server_url}/mcp", "--allow-http"],
+        },
+        client_session_timeout_seconds=300,
+    )
+
+
+async def ensure_mcp_connection(session_id: str) -> None:
+    """Re-establish the router connection if the mcp-remote bridge died (e.g. router restart)."""
+    session_data = agent_sessions[session_id]
+    agent = session_data["agent"]
+    run_context = {
+        "session_id": session_id,
+        "agent_name": agent.name,
+        "conversation_id": session_id,
+    }
+
+    for index, mcp_server in enumerate(list(session_data["mcp_servers"])):
+        try:
+            await mcp_server.list_tools(run_context=run_context, agent=agent)
+            continue
+        except Exception:
+            logging.warning(
+                "MCP connection for session %s is dead, reconnecting", session_id
+            )
+
+        try:
+            await mcp_server.cleanup()
+        except Exception:
+            pass
+
+        replacement = build_metis_mcp_server(session_id)
+        await replacement.connect()
+        session_data["mcp_servers"][index] = replacement
+        agent.mcp_servers = session_data["mcp_servers"]
+
+
 @app.post("/connect")
 async def connect_endpoint(request: Dict[str, Any]):
     """Initialize agent session"""
@@ -198,16 +246,10 @@ async def connect_endpoint(request: Dict[str, Any]):
         session_id = str(uuid.uuid4())
         chat_history = request.get("chat_history", [])
 
+        logging.info("Creating session %s with model %s", session_id, DEFAULT_MODEL)
+
         # Create Metis MCP server connection for this session
-        server_url = os.getenv("SERVER_URL", "http://localhost:9999")
-        metis_mcp_server = MCPServerStdio(
-            name=f"metis-{session_id}",
-            params={
-                "command": "npx",
-                "args": ["-y", "mcp-remote", f"{server_url}/mcp"],
-            },
-            client_session_timeout_seconds=300,
-        )
+        metis_mcp_server = build_metis_mcp_server(session_id)
 
         # Initialize MCP server connection
         await metis_mcp_server.connect()
@@ -217,7 +259,11 @@ async def connect_endpoint(request: Dict[str, Any]):
             name=f"metis-agent-{session_id}",
             instructions=create_agent_instructions(chat_history),
             mcp_servers=[metis_mcp_server],
-            model=DEFAULT_MODEL,
+            model=OpenAIChatCompletionsModel(
+                model=DEFAULT_MODEL,
+                openai_client=OPENAI_CLIENT,
+                strict_feature_validation=False,
+            ),
             model_settings=ModelSettings(parallel_tool_calls=False),
         )
 
@@ -294,25 +340,22 @@ async def stream_response(session_id: str, request: Request):
                 yield f"data: {json.dumps({'type': 'error', 'message': 'No user message to process'})}\n\n"
                 return
 
-            # Prepare input for agent - clean chat history to remove non-standard fields
-            if len(chat_history) > 1:
-                # Clean chat history for OpenAI API - only include role and content
-                cleaned_history = []
-                for msg in chat_history[-10:]:  # Last 10 messages for context
-                    cleaned_msg = {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content", ""),
-                    }
-                    cleaned_history.append(cleaned_msg)
-                agent_input = cleaned_history
-            else:
-                agent_input = chat_history[-1]["content"]
+            await ensure_mcp_connection(session_id)
+
+            # Use plain text for history because the vLLM Responses adapter can
+            # turn structured tool results into an invalid nested content list.
+            recent_history = chat_history[-10:]
+            agent_input = "\n\n".join(
+                f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+                for msg in recent_history
+            )
 
             # Track tool call buffers for this stream
             tool_call_buffers = defaultdict(str)
             tool_call_names = {}  # Map call_id to tool name
             most_recent_call_id = None  # Track the most recent call_id
             full_response = ""
+            saw_text_delta = False
 
             # Run agent with streaming
             print(f"\n\nRecent context: {agent_input}\n\n")
@@ -328,6 +371,7 @@ async def stream_response(session_id: str, request: Request):
 
                     if isinstance(data, ResponseTextDeltaEvent):
                         token = data.delta
+                        saw_text_delta = True
                         full_response += token
                         yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
@@ -418,17 +462,20 @@ async def stream_response(session_id: str, request: Request):
                             except Exception:
                                 yield f"data: {json.dumps({'type': 'tool_response', 'name': tool_name, 'call_id': call_id, 'output': output})}\n\n"
 
-                    # Add assistant response to history
-                    if full_response:
-                        # print(f"Full response: \n\n{full_response}")
-                        chat_history.append(
-                            {"role": "assistant", "content": full_response}
-                        )
+            final_output = getattr(result, "final_output", None)
+            if not saw_text_delta and final_output:
+                fallback_response = str(final_output)
+                full_response = fallback_response
+                yield f"data: {json.dumps({'type': 'token', 'content': fallback_response})}\n\n"
+
+            if full_response:
+                chat_history.append({"role": "assistant", "content": full_response})
 
             # Signal completion
             yield f"data: {json.dumps({'type': 'completion', 'message': 'Response completed'})}\n\n"
 
         except Exception as e:
+            logging.exception("Stream response failed for session %s", session_id)
             yield f"data: {json.dumps({'type': 'error', 'message': f'Agent execution error: {str(e)}'})}\n\n"
 
         finally:
@@ -476,6 +523,14 @@ async def get_session_status(session_id: str):
     }
 
 
+def _split_tool_origin(description: Optional[str]) -> tuple[Optional[str], str]:
+    """Split the router's "[server] description" tag into (server, description)."""
+    match = re.match(r"^\[([^\]]+)\]\s*(.*)$", description or "", re.DOTALL)
+    if not match:
+        return None, (description or "").strip()
+    return match.group(1).strip(), match.group(2).strip()
+
+
 @app.get("/sessions/{session_id}/tools")
 async def list_session_tools(session_id: str):
     """List tools available for the agent in this session"""
@@ -485,9 +540,11 @@ async def list_session_tools(session_id: str):
 
     session_data = agent_sessions[session_id]
     agent = session_data["agent"]
-    mcp_servers = session_data["mcp_servers"]
 
     try:
+        await ensure_mcp_connection(session_id)
+        mcp_servers = session_data["mcp_servers"]
+
         # Create run context
         run_context = {
             "session_id": session_id,
@@ -503,12 +560,20 @@ async def list_session_tools(session_id: str):
 
         # Format tools for response
         formatted_tools = []
+        server_names = []
         for tool in tools_list:
-            # Extract tool information in a reasonable structure
+            # The router prefixes each description with "[<origin server>] "
+            origin_server, description = _split_tool_origin(tool.description)
+
             tool_info = {
                 "name": tool.name,
-                "description": tool.description,
+                "full_name": tool.name,
+                "description": description,
+                "server": origin_server or "metis",
             }
+
+            if origin_server and origin_server not in server_names:
+                server_names.append(origin_server)
 
             # Add input schema if available
             if hasattr(tool, "input_schema") and tool.input_schema:
@@ -523,7 +588,7 @@ async def list_session_tools(session_id: str):
             "agent_name": agent.name,
             "tools_count": len(formatted_tools),
             "tools": formatted_tools,
-            "mcp_server_names": [mcp_server.name for mcp_server in mcp_servers],
+            "mcp_server_names": server_names,
         }
 
     except Exception as e:

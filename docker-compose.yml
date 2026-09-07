@@ -1,4 +1,15 @@
 services:
+  ubuntu-controller:
+    image: ubuntu-mcp-server:latest
+    container_name: metis-ubuntu-controller
+    command: ["--policy", "dev"]
+    volumes:
+      - /opt:/opt
+      - /tmp/metis-jobs:/tmp/metis-jobs
+    networks:
+      - metis-network
+    restart: unless-stopped
+
   server:
     build:
       context: ./server
@@ -6,10 +17,13 @@ services:
       target: runtime
     container_name: metis-server
     ports:
-      - "9999:9999"
+      - "127.0.0.1:9999:9999"
     environment:
       - NODE_ENV=production
       - SERVER_PORT=9999
+    extra_hosts:
+      - "videohead.duckdns.org:host-gateway"
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     volumes:
@@ -27,7 +41,9 @@ services:
       timeout: 10s
       start_period: 5s
       retries: 3
-    depends_on: []
+    depends_on:
+      ubuntu-controller:
+        condition: service_started
     logging:
       driver: "json-file"
       options:
@@ -41,11 +57,13 @@ services:
       target: runtime
     container_name: metis-backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     environment:
       - PYTHON_ENV=production
       - BACKEND_PORT=8000
       - SERVER_URL=http://server:9999
+    extra_hosts:
+      - "videohead.duckdns.org:host-gateway"
     env_file:
       - .env
     networks:
@@ -71,13 +89,16 @@ services:
       context: ./client/frontend
       dockerfile: Dockerfile
       target: production
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}
     container_name: metis-frontend
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     environment:
       - NODE_ENV=production
       - FRONTEND_PORT=3000
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     env_file:
       - .env
     networks:
@@ -100,8 +121,8 @@ services:
 
 networks:
   metis-network:
-    driver: bridge
     name: metis-network
+    external: true
 
 volumes:
   # Named volumes for caching (optional, using bind mounts for data)

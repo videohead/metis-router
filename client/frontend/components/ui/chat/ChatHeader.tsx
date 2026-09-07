@@ -3,6 +3,7 @@ import React from 'react';
 import { useChatStore } from '@/lib/stores/chatStore';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import ProjectsMenu from './ProjectsMenu';
 
 const ChatHeader = () => {
   const { clearMessages } = useChatStore();
@@ -21,6 +22,7 @@ const ChatHeader = () => {
       </div>
 
       <div className="flex items-center space-x-2">
+        <ProjectsMenu />
         <Button
           variant="outline"
           size="sm"

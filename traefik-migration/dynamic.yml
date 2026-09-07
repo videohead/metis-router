@@ -1,0 +1,160 @@
+http:
+  routers:
+    wordpress:
+      rule: "Host(`videohead.duckdns.org`)"
+      entryPoints:
+        - websecure
+      priority: 1
+      service: wordpress
+      tls:
+        certResolver: le
+
+    studio:
+      rule: "Host(`videohead.duckdns.org`) && PathPrefix(`/studio`)"
+      entryPoints:
+        - websecure
+      priority: 100
+      service: studio
+      tls:
+        certResolver: le
+
+    metis:
+      rule: "Host(`videohead.duckdns.org`) && (Path(`/metis`) || PathPrefix(`/metis/`))"
+      entryPoints:
+        - websecure
+      priority: 100
+      middlewares:
+        - strip-metis
+      service: metis
+      tls:
+        certResolver: le
+
+    metis-api:
+      rule: "Host(`videohead.duckdns.org`) && PathPrefix(`/metis-api`)"
+      entryPoints:
+        - websecure
+      priority: 110
+      middlewares:
+        - strip-metis-api
+      service: metis-api
+      tls:
+        certResolver: le
+
+    metis-mcp:
+      rule: "Host(`videohead.duckdns.org`) && PathPrefix(`/metis-mcp`)"
+      entryPoints:
+        - websecure
+      priority: 110
+      middlewares:
+        - strip-metis-mcp
+      service: metis-mcp
+      tls:
+        certResolver: le
+
+    comfy:
+      rule: "Host(`videohead.duckdns.org`) && (Path(`/comfy`) || PathPrefix(`/comfy/`))"
+      entryPoints:
+        - websecure
+      priority: 100
+      middlewares:
+        - strip-comfy
+      service: comfy
+      tls:
+        certResolver: le
+
+    comfy-mcp:
+      rule: "Host(`videohead.duckdns.org`) && PathPrefix(`/comfy-mcp`)"
+      entryPoints:
+        - websecure
+      priority: 110
+      middlewares:
+        - strip-comfy-mcp
+      service: comfy-mcp
+      tls:
+        certResolver: le
+
+    vllm:
+      rule: "Host(`videohead.duckdns.org`) && PathPrefix(`/vllm`)"
+      entryPoints:
+        - websecure
+      priority: 100
+      middlewares:
+        - strip-vllm
+      service: vllm
+      tls:
+        certResolver: le
+
+  middlewares:
+    strip-metis:
+      stripPrefix:
+        prefixes:
+          - /metis
+    strip-metis-api:
+      stripPrefix:
+        prefixes:
+          - /metis-api
+    strip-metis-mcp:
+      stripPrefix:
+        prefixes:
+          - /metis-mcp
+    strip-comfy:
+      stripPrefix:
+        prefixes:
+          - /comfy
+    strip-comfy-mcp:
+      stripPrefix:
+        prefixes:
+          - /comfy-mcp
+    strip-vllm:
+      stripPrefix:
+        prefixes:
+          - /vllm
+
+  services:
+    wordpress:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8000"
+        passHostHeader: true
+
+    studio:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3000"
+        passHostHeader: true
+
+    metis:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:5000"
+        passHostHeader: true
+
+    metis-api:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:14000"
+        passHostHeader: true
+
+    metis-mcp:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:9999"
+        passHostHeader: true
+
+    comfy:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8188"
+        passHostHeader: true
+
+    comfy-mcp:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:9000"
+        passHostHeader: true
+
+    vllm:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:11434"
+        passHostHeader: true

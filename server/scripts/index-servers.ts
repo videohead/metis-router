@@ -365,19 +365,35 @@ async function loadMCPRegistryConfigs(): Promise<MCPServerConfig[]> {
     const configs: MCPServerConfig[] = [];
     for (const [name, serverConfig] of Object.entries(registry.mcpServers)) {
       const config = serverConfig as any;
-      
-      configs.push({
-        name,
-        displayName: name,
-        connection: {
-          type: 'command',
-          command: config.command,
-          args: config.args || [],
-          env: config.env || {}
-        },
-        description: `${name} MCP server`,
-        category: 'registry'
-      });
+
+      if (config.url) {
+        // URL-based servers (streamable-http / sse)
+        configs.push({
+          name,
+          displayName: name,
+          connection: {
+            type: 'streamable-http',
+            url: config.url,
+            env: config.env || {},
+            headers: config.headers
+          },
+          description: config.description || `${name} MCP server`,
+          category: 'registry'
+        });
+      } else {
+        configs.push({
+          name,
+          displayName: name,
+          connection: {
+            type: 'command',
+            command: config.command,
+            args: config.args || [],
+            env: config.env || {}
+          },
+          description: `${name} MCP server`,
+          category: 'registry'
+        });
+      }
     }
 
     return configs;

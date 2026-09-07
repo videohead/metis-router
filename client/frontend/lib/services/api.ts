@@ -36,7 +36,7 @@ export interface ToolsResponse {
   agent_name: string;
   tools_count: number;
   tools: Tool[];
-  mcp_server_name: string;
+  mcp_server_names: string[];
 }
 
 // SSE Event types
@@ -109,89 +109,95 @@ class ApiService {
     onError: (error: string) => void
   ): Promise<void> {
     try {
-      const eventSource = new EventSource(`${API_BASE_URL}/sessions/${sessionId}/stream`);
+      return await new Promise<void>((resolve, reject) => {
+        let settled = false;
 
-      eventSource.onmessage = (event) => {
-        // Only log tool-call related events to reduce noise
-        const isToolEvent = event.data.includes('"tool_call"') || event.data.includes('"tool_response"') || event.data.includes('"tool_call_');
-        
-        try {
-          const data: SSEEvent = JSON.parse(event.data);
-          console.log('📥 FRONTEND API: Received SSE event:', data);
-          
-          switch (data.type) {
-            case 'token':
-              if (data.content) {
-                onToken(data.content);
-              }
-              break;
-            case 'tool_call_started':
-              console.log('🚀 FRONTEND API: Tool call started:', data);
-              onToolCall({ 
-                name: data.name || data.tool_name,
-                call_id: data.call_id,
-                arguments: data.arguments 
-              });
-              break;
-            case 'tool_call':
-              console.log('🔧 FRONTEND API: Tool call with arguments:', data);
-              // Only update if this is a new tool call we haven't seen before
-              onToolCall({ 
-                name: data.name,
-                call_id: data.call_id,
-                arguments: data.arguments 
-              });
-              break;
-            case 'tool_call_complete':
-              console.log('✅ FRONTEND API: Tool call complete:', data);
-              // Don't create new tool call, this should just mark completion
-              // The chatStore will handle this by updating existing tool call status
-              break;
-            case 'tool_call_finished':
-              console.log('🏁 FRONTEND API: Tool call finished:', data);
-              // Don't create new tool call, this is just a status update
-              break;
-            case 'tool_response':
-              console.log('📤 FRONTEND API: Tool response:', data);
-              if (data.output !== undefined) {
-                onToolResponse({ 
+        const settle = (callback: () => void) => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          callback();
+        };
+
+        const eventSource = new EventSource(`${API_BASE_URL}/sessions/${sessionId}/stream`);
+
+        eventSource.onmessage = (event) => {
+          // Only log tool-call related events to reduce noise
+          const isToolEvent = event.data.includes('"tool_call"') || event.data.includes('"tool_response"') || event.data.includes('"tool_call_');
+
+          try {
+            const data: SSEEvent = JSON.parse(event.data);
+            console.log('📥 FRONTEND API: Received SSE event:', data);
+
+            switch (data.type) {
+              case 'token':
+                if (data.content) {
+                  onToken(data.content);
+                }
+                break;
+              case 'tool_call_started':
+                console.log('🚀 FRONTEND API: Tool call started:', data);
+                onToolCall({
+                  name: data.name || data.tool_name,
+                  call_id: data.call_id,
+                  arguments: data.arguments
+                });
+                break;
+              case 'tool_call':
+                console.log('🔧 FRONTEND API: Tool call with arguments:', data);
+                onToolCall({
                   name: data.name,
                   call_id: data.call_id,
-                  output: data.output 
+                  arguments: data.arguments
                 });
-              }
-              break;
-            case 'completion':
-              onCompletion();
-              eventSource.close();
-              break;
-            case 'error':
-              console.log('❌ Stream error event:', data.message);
-              onError(data.message || 'Unknown error');
-              eventSource.close();
-              break;
-            default:
-              // Only log unknown tool-related events
-              if (isToolEvent) {
-                console.log('❓ Unknown tool event:', data.type, data);
-              }
+                break;
+              case 'tool_call_complete':
+                console.log('✅ FRONTEND API: Tool call complete:', data);
+                break;
+              case 'tool_call_finished':
+                console.log('🏁 FRONTEND API: Tool call finished:', data);
+                break;
+              case 'tool_response':
+                console.log('📤 FRONTEND API: Tool response:', data);
+                if (data.output !== undefined) {
+                  onToolResponse({
+                    name: data.name,
+                    call_id: data.call_id,
+                    output: data.output
+                  });
+                }
+                break;
+              case 'completion':
+                onCompletion();
+                eventSource.close();
+                settle(resolve);
+                break;
+              case 'error':
+                console.log('❌ Stream error event:', data.message);
+                onError(data.message || 'Unknown error');
+                eventSource.close();
+                settle(() => reject(new Error(data.message || 'Unknown stream error')));
+                break;
+              default:
+                if (isToolEvent) {
+                  console.log('❓ Unknown tool event:', data.type, data);
+                }
+            }
+          } catch (err) {
+            console.error('❌ Error parsing SSE event:', err, 'Raw data:', event.data);
+            onError('Failed to parse streamed response');
+            eventSource.close();
+            settle(() => reject(err instanceof Error ? err : new Error('Failed to parse streamed response')));
           }
-        } catch (err) {
-          console.error('❌ Error parsing SSE event:', err, 'Raw data:', event.data);
-        }
-      };
+        };
 
-      eventSource.onerror = (error) => {
-        console.error('❌ SSE connection error:', error);
-        onError('Connection error');
-        eventSource.close();
-      };
-
-      return new Promise((resolve) => {
-        const originalOnCompletion = onCompletion;
-        onCompletion = () => {
-          originalOnCompletion();
-          resolve();
+        eventSource.onerror = (error) => {
+          console.error('❌ SSE connection error:', error);
+          onError('Connection error');
+          eventSource.close();
+          settle(() => reject(new Error('Connection error')));
         };
       });
     } catch (error) {

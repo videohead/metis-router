@@ -8,6 +8,10 @@ export interface StandardMCPServerConfig {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  basicAuth?: {
+    username: string;
+    password: string;
+  };
 }
 
 export interface StandardMCPConfig {
@@ -24,6 +28,10 @@ export interface ServerConfig {
     env?: Record<string, string> | string[];
     url?: string;
     headers?: Record<string, string>;
+    basicAuth?: {
+      username: string;
+      password: string;
+    };
   };
 }
 
@@ -33,6 +41,29 @@ export interface Config {
 }
 
 const DEFAULT_CONFIG_PATH = './config.json';
+
+function resolveEnvironmentVariables(env: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).map(([name, value]) => {
+      const match = value.match(/^\$\{([A-Z0-9_]+)\}$/);
+      return [name, match ? process.env[match[1]] || '' : value];
+    })
+  );
+}
+
+function resolveHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => {
+      const match = value.match(/^\$\{([A-Z0-9_]+)\}$/);
+      return [name, match ? process.env[match[1]] || '' : value];
+    })
+  );
+}
+
+function resolveValue(value: string): string {
+  const match = value.match(/^\$\{([A-Z0-9_]+)\}$/);
+  return match ? process.env[match[1]] || '' : value;
+}
 
 /**
  * Convert standard MCP config format to our internal format
@@ -52,7 +83,7 @@ export function convertStandardMCPConfig(standardConfig: StandardMCPConfig): Con
       internalConfig.transport.command = serverConfig.command;
       internalConfig.transport.args = serverConfig.args || [];
       if (serverConfig.env) {
-        internalConfig.transport.env = serverConfig.env;
+        internalConfig.transport.env = resolveEnvironmentVariables(serverConfig.env);
       }
     } else if (serverConfig.url) {
       // URL-based server - determine type based on URL or default to SSE
@@ -63,7 +94,13 @@ export function convertStandardMCPConfig(standardConfig: StandardMCPConfig): Con
       }
       internalConfig.transport.url = serverConfig.url;
       if (serverConfig.headers) {
-        internalConfig.transport.headers = serverConfig.headers;
+        internalConfig.transport.headers = resolveHeaders(serverConfig.headers);
+      }
+      if (serverConfig.basicAuth) {
+        internalConfig.transport.basicAuth = {
+          username: resolveValue(serverConfig.basicAuth.username),
+          password: resolveValue(serverConfig.basicAuth.password)
+        };
       }
     }
 
@@ -99,7 +136,15 @@ export function loadConfig(configPath?: string): Config {
     
     // Otherwise assume it's our internal format
     console.log('📝 Loading internal configuration format...');
-    return parsed as Config;
+    const config = parsed as Config;
+    config.servers = config.servers.map(server => ({
+      ...server,
+      transport: {
+        ...server.transport,
+        headers: server.transport.headers ? resolveHeaders(server.transport.headers) : undefined
+      }
+    }));
+    return config;
   } catch (error) {
     console.error(`Failed to load config from ${filePath}:`, error);
     return { servers: [], active_mcp_queue: [] };

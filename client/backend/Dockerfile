@@ -40,6 +40,8 @@ WORKDIR /app
 # Install only runtime system dependencies (curl for health checks)
 RUN apt-get update && apt-get install -y \
     curl \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -49,8 +51,13 @@ COPY --from=dependencies /opt/venv /opt/venv
 # Activate virtual environment
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Create non-root user for security with a writable home for npx cache
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -m -d /home/appuser appuser && \
+    mkdir -p /home/appuser/.npm && \
+    chown -R appuser:appuser /home/appuser
+
+ENV NPM_CONFIG_CACHE=/home/appuser/.npm
 
 # Copy application code
 COPY --chown=appuser:appuser . .

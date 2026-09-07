@@ -1,0 +1,32 @@
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+api:
+  dashboard: false
+
+log:
+  level: INFO
+
+accessLog: {}
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+certificatesResolvers:
+  le:
+    acme:
+      email: videohead@hotmail.com
+      storage: /acme.json
+      httpChallenge:
+        entryPoint: web

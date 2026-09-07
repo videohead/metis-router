@@ -53,12 +53,14 @@ services:
       target: development  # Use development stage with hot reloading
     container_name: metis-backend-dev
     ports:
-      - "8000:8000"
+      - "18000:8000"
       - "5678:5678"  # Python debugging port (debugpy)
     environment:
       - PYTHON_ENV=development
       - BACKEND_PORT=8000
       - SERVER_URL=http://server:9999
+      - OPENAI_API_KEY=not-needed
+      - OPENAI_BASE_URL=https://videohead.duckdns.org/vllm/v1
       - PYTHONPATH=/app
       - PYTHONDONTWRITEBYTECODE=1  # Prevent .pyc files
       - PYTHONUNBUFFERED=1  # Ensure stdout/stderr are unbuffered
@@ -101,7 +103,7 @@ services:
     environment:
       - NODE_ENV=development
       - FRONTEND_PORT=3000
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=http://localhost:18000
       - NEXT_TELEMETRY_DISABLED=1
       - WATCHPACK_POLLING=true  # Enable polling for file changes in containers
       - CHOKIDAR_USEPOLLING=true  # Alternative file watching method

@@ -64,12 +64,13 @@ const ChatComposer = () => {
     if (!input.trim() || isConnecting || isTyping) return;
 
     const userInput = input;
-    setInput("");
 
     // Send message using the simplified system
     const success = await sendMessage(userInput);
-    
-    if (!success) {
+
+    if (success) {
+      setInput("");
+    } else {
       console.error("Failed to send message");
     }
   };

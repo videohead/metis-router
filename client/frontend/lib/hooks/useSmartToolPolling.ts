@@ -22,19 +22,14 @@ export const useSmartToolPolling = (sessionId?: string) => {
       
       const response = await apiService.listSessionTools(sessionId);
       
-      // Transform tools to match the expected format
-      const formattedTools = response.tools.map(tool => {
-        // Use the MCP server name from the response instead of extracting from tool name
-        // This prevents issues with tools that have hyphens in their names (e.g., "create-pages")
-        const serverName = response.mcp_server_name;
-        
-        return {
-          name: tool.name,
-          full_name: tool.name,
-          description: tool.description || 'No description available',
-          server: serverName
-        };
-      });
+      // The backend resolves the originating MCP server per tool, since a single
+      // session connects to the router which aggregates many upstream servers.
+      const formattedTools = response.tools.map(tool => ({
+        name: tool.name,
+        full_name: tool.full_name || tool.name,
+        description: tool.description || 'No description available',
+        server: tool.server || 'metis'
+      }));
       
       setTools(formattedTools);
       setIsLoading(false);
