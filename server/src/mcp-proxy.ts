@@ -61,11 +61,41 @@ export const createServer = async () => {
   // Strip any existing "[server] " prefix so double-listing doesn't compound it.
   const stripPrefix = (desc: string | undefined) => (desc || '').replace(/^\[[^\]]+\]\s*/, '');
   const ns = (server: string, name: string) => `${server}:${name}`;
+  const defaultFilesystemServer = 'ubuntu-controller';
+  const defaultFilesystemTools = new Set([
+    'execute_command',
+    'list_directory',
+    'read_file',
+    'write_file',
+    'update_file',
+    'create_directory',
+    'move_path',
+    'delete_path',
+    'filesystem_diagnostics',
+  ]);
   // Register a name so both the canonical prefixed form and the bare original
   // resolve, but never let a bare name steal an already-claimed route.
   const registerRoute = (map: Map<string, ConnectedClient>, server: string, name: string, client: ConnectedClient) => {
     map.set(ns(server, name), client);
     if (!map.has(name)) map.set(name, client);
+  };
+
+  const registerTool = (allTools: Tool[], client: ConnectedClient, tool: Tool) => {
+    registerRoute(toolToClientMap, client.name, tool.name, client);
+    allTools.push({
+      ...tool,
+      name: ns(client.name, tool.name),
+      description: `[${client.name}] ${stripPrefix(tool.description)}`,
+    });
+    if (client.name === defaultFilesystemServer && defaultFilesystemTools.has(tool.name)) {
+      const alias = `filesystem:${tool.name}`;
+      toolToClientMap.set(alias, client);
+      allTools.push({
+        ...tool,
+        name: alias,
+        description: `[default filesystem via ${client.name}] ${stripPrefix(tool.description)}`,
+      });
+    }
   };
 
   // Swap a reconnected client into the active set and invalidate cached routes.
@@ -77,6 +107,15 @@ export const createServer = async () => {
     toolToClientMap.clear();
     resourceToClientMap.clear();
     promptToClientMap.clear();
+    try {
+      const result = await fresh.client.request(
+        { method: 'tools/list', params: {} },
+        ListToolsResultSchema,
+      );
+      result.tools?.forEach((tool: Tool) => registerTool([], fresh, tool));
+    } catch (error) {
+      console.error(`Failed to rebuild tool routes for reconnected server ${name}:`, error);
+    }
     mcpLog(`Rebuilt routing after reconnect of ${name}`);
     notifyToolListChanged();
   };
@@ -119,7 +158,7 @@ export const createServer = async () => {
   // reconnect (not just a retry) is required.
   const isConnectionError = (error: any) =>
     error?.code === -32000 ||
-    /session not found|connection closed|terminated|fetch failed/i.test(String(error?.message ?? ''));
+    /session not found|connection closed|terminated|fetch failed|operation was aborted/i.test(String(error?.message ?? ''));
 
   // Load configuration and connect to servers
   let config = loadConfig();
@@ -227,15 +266,7 @@ export const createServer = async () => {
         );
 
         if (result.tools) {
-          const toolsWithSource = result.tools.map((tool: Tool) => {
-            registerRoute(toolToClientMap, connectedClient.name, tool.name, connectedClient);
-            return {
-              ...tool,
-              name: ns(connectedClient.name, tool.name),
-              description: `[${connectedClient.name}] ${stripPrefix(tool.description)}`
-            };
-          });
-          allTools.push(...toolsWithSource);
+          result.tools.forEach((tool: Tool) => registerTool(allTools, connectedClient, tool));
         }
       } catch (error) {
         console.error(`Error fetching tools from ${connectedClient.name}:`, error);
@@ -250,8 +281,7 @@ export const createServer = async () => {
                 const retry = await fresh.client.request({ method: 'tools/list', params: { _meta: request.params?._meta } }, ListToolsResultSchema);
                 if (retry.tools) {
                   for (const tool of retry.tools) {
-                    registerRoute(toolToClientMap, fresh.name, tool.name, fresh);
-                    allTools.push({ ...tool, name: ns(fresh.name, tool.name), description: `[${fresh.name}] ${stripPrefix(tool.description)}` });
+                    registerTool(allTools, fresh, tool);
                   }
                 }
               } catch (e) {
@@ -310,14 +340,18 @@ export const createServer = async () => {
       }
     });
 
+    allTools.push({
+      name: 'mcp_diagnostics',
+      description: 'Report connected MCP upstreams and verify that the default Ubuntu filesystem CRUD routes are available.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+
     return { tools: allTools };
   });
 
   // Call Tool Handler
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    
-    console.log(`CallTool request: ${name}, available tools: ${Array.from(toolToClientMap.keys()).join(', ')}`);
     
     // Handle the add_new_mcp tool
     if (name === 'add_new_mcp') {
@@ -485,13 +519,74 @@ export const createServer = async () => {
       }
     }
 
+    if (name === 'mcp_diagnostics') {
+      const configuredServers = config.servers.map(serverConfig => serverConfig.name).sort();
+      const connectedServers = connectedClients.map(client => client.name).sort();
+      const upstreamToolCounts: Record<string, number> = {};
+      const refreshErrors: Record<string, string> = {};
+      for (const connectedClient of connectedClients) {
+        try {
+          const result = await connectedClient.client.request(
+            { method: 'tools/list', params: {} },
+            ListToolsResultSchema,
+          );
+          upstreamToolCounts[connectedClient.name] = result.tools?.length ?? 0;
+          result.tools?.forEach((tool: Tool) => registerTool([], connectedClient, tool));
+        } catch (error) {
+          refreshErrors[connectedClient.name] = error instanceof Error ? error.message : String(error);
+        }
+      }
+      const expectedAliases = Array.from(defaultFilesystemTools, tool => `filesystem:${tool}`);
+      const availableAliases = expectedAliases.filter(tool => toolToClientMap.has(tool));
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            configuredServers,
+            connectedServers,
+            disconnectedServers: configuredServers.filter(name => !connectedServers.includes(name)),
+            routedToolCount: toolToClientMap.size,
+            upstreamToolCounts,
+            refreshErrors,
+            defaultFilesystemServer,
+            defaultFilesystem: {
+              ready: availableAliases.length === expectedAliases.length,
+              availableTools: availableAliases,
+              missingTools: expectedAliases.filter(tool => !toolToClientMap.has(tool)),
+            },
+          }, null, 2),
+        }],
+      };
+    }
+
     // Resolve "server:tool" (canonical) or a bare name; forward the bare tool name upstream.
-    const clientForTool = toolToClientMap.get(name);
+    let clientForTool = toolToClientMap.get(name);
     const upstreamToolName = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
 
     if (!clientForTool) {
-      throw new Error(`Unknown tool: ${name}`);
+      console.warn(`Route miss for ${name}; refreshing tools from connected upstreams`);
+      for (const connectedClient of connectedClients) {
+        try {
+          const result = await connectedClient.client.request(
+            { method: 'tools/list', params: {} },
+            ListToolsResultSchema,
+          );
+          result.tools?.forEach((tool: Tool) => registerTool([], connectedClient, tool));
+        } catch (error) {
+          console.error(`Route refresh failed for ${connectedClient.name}:`, error);
+          if (isConnectionError(error)) {
+            await reconnectServer(connectedClient.name, 2);
+          }
+        }
+      }
+      clientForTool = toolToClientMap.get(name);
     }
+
+    if (!clientForTool) {
+      throw new Error(`Unknown tool: ${name}. Run mcp_diagnostics to inspect connected servers and default filesystem routes.`);
+    }
+
+    console.log(`CallTool request: ${name}; upstream=${clientForTool.name}:${upstreamToolName}; routed=${toolToClientMap.size}`);
 
     // >>> BEGINNING OF HEATING LOGIC >>> 
     try {

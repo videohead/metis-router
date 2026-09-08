@@ -2,6 +2,7 @@ services:
   ubuntu-controller:
     image: ubuntu-mcp-server:latest
     container_name: metis-ubuntu-controller
+    user: "0:0"
     command: ["--policy", "dev"]
     volumes:
       - /opt:/opt
