@@ -2,7 +2,17 @@ services:
   ubuntu-controller:
     image: ubuntu-mcp-server:latest
     container_name: metis-ubuntu-controller
-    user: "0:0"
+    # Run as root only so the server can chown/chmod its own temp dirs; file
+    # writes on the host-mounted /opt volume inherit the shared optusers group
+    # via setgid dirs, and the umask below keeps new files group-writable
+    # instead of root-only (700). Set HOST_RUN_AS to "1000:1005" (mcp:optusers)
+    # to drop root entirely.
+    user: "${HOST_RUN_AS:-0:0}"
+    group_add:
+      - "1005" # optusers — so written files are accessible to host users
+    environment:
+      # Default umask 007 would make files 700/600. 002 keeps them group-rw.
+      - MCP_FILE_UMASK=0002
     command: ["--policy", "dev"]
     volumes:
       - /opt:/opt
