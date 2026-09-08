@@ -83,6 +83,9 @@ app.use((req, res, next) => {
 // Create shared MCP server instance
 const { server, cleanup } = await createServer();
 let sharedTransport: StreamableHTTPServerTransport | null = null;
+// Cached initialize result so additional clients can join the shared session
+// instead of resetting it out from under in-flight clients.
+let cachedInitResult: unknown = null;
 
 // Set up global notification function for the MCP proxy
 global.notifyAllSessions = (notification: any) => {
@@ -105,6 +108,19 @@ app.post('/mcp', async (req, res) => {
   
   // If this is an initialization request, always create a fresh transport
   if (isInitializeRequest(req.body)) {
+    // A healthy shared session is reused: tearing it down for every new client
+    // breaks in-flight clients whose next POST would hit a null transport.
+    if (sharedTransport?.sessionId && cachedInitResult) {
+      mcpLog(`Joining existing shared session: ${sharedTransport.sessionId}`);
+      res.setHeader('mcp-session-id', sharedTransport.sessionId);
+      res.status(200).json({
+        jsonrpc: '2.0',
+        id: (req.body as { id?: unknown })?.id ?? null,
+        result: cachedInitResult,
+      });
+      return;
+    }
+
     mcpLog('Creating new transport for initialization request (resetting existing if needed)');
     
     // Clean up existing transport if it exists
@@ -115,6 +131,7 @@ app.post('/mcp', async (req, res) => {
       } catch (error) {
         console.warn('Warning: Error cleaning up existing transport:', error);
       }
+      cachedInitResult = null;
     }
     
     sharedTransport = new StreamableHTTPServerTransport({
@@ -135,8 +152,33 @@ app.post('/mcp', async (req, res) => {
       console.log('Connecting to shared MCP server');
       await server.connect(sharedTransport);
       
+      // Capture the initialize result bytes so later clients can join the session.
+      const initChunks: Buffer[] = [];
+      const origWrite = res.write.bind(res);
+      const origEnd = res.end.bind(res);
+      res.write = ((chunk: unknown, ...rest: unknown[]) => {
+        if (chunk) initChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        return (origWrite as any)(chunk, ...rest);
+      }) as typeof res.write;
+      res.end = ((chunk: unknown, ...rest: unknown[]) => {
+        if (chunk && typeof chunk !== 'function') initChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        return (origEnd as any)(chunk, ...rest);
+      }) as typeof res.end;
+
       // Handle the initialization request
       await sharedTransport.handleRequest(req, res, req.body);
+
+      try {
+        const bodyText = Buffer.concat(initChunks).toString('utf8');
+        const dataLine = bodyText.split('\n').find((line) => line.startsWith('data:'));
+        const payload = JSON.parse(dataLine ? dataLine.slice(5).trim() : bodyText);
+        if (payload?.result?.capabilities) {
+          cachedInitResult = payload.result;
+          mcpLog('Cached initialize result for shared-session joins');
+        }
+      } catch {
+        mcpLog('Could not cache initialize result; session joins disabled for this transport');
+      }
     } catch (error: any) {
       sharedTransport = null;
       if (error.code === -32001 || error.message?.includes('Unauthorized')) {
@@ -208,14 +250,14 @@ app.get('/mcp', async (req, res) => {
 app.delete('/mcp', async (req, res) => {
   if (!sharedTransport) {
     mcpLog('No shared transport available for DELETE request');
-    res.status(400).send('No active transport available');
+    res.status(200).send('No active session');
     return;
   }
-  
-  mcpLog(`Deleting shared transport`);
-  await sharedTransport.close();
-  sharedTransport = null;
-  res.status(200).send('Transport deleted');
+
+  // One client closing must not tear down the session other clients share.
+  // The transport is only reset on genuine close or process restart.
+  mcpLog(`DELETE received; retaining shared session ${sharedTransport.sessionId ?? ''}`);
+  res.status(200).send('Shared session retained');
 });
 
 // Health check endpoint
