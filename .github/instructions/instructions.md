@@ -8,11 +8,19 @@ pieces run in Docker on the shared `metis-network`:
 - `metis-backend` (FastAPI, `127.0.0.1:14000`) — OpenAI Agents SDK chat agent
 - `metis-server` (Node.js MCP router, `127.0.0.1:9999`) — the cross-service
   MCP gateway. It aggregates the downstream servers in `server/config.json`
-  / `server/mcp-registry.json` (`ubuntu-controller`, `github`, `worldgraph`,
-  `comfyui`, `morphazoid`, `videobrain`, `openharness`) and exposes their tools
-  with `<server>:` name prefixes. It is also published externally at
-  `https://videohead.duckdns.org/metis-mcp/mcp` for remote MCP clients such as
-  VS Code.
+  / `server/mcp-registry.json` (`ubuntu-controller`, `github`, `comfyui`,
+  `docker-mcp`) and exposes their tools with `<server>:` name prefixes. It is also published
+  externally at `https://videohead.duckdns.org/metis-mcp/mcp` for remote MCP
+  clients such as VS Code.
+- `docker-mcp-gateway` (`docker/mcp-gateway` image, internal-only) — Docker's
+  MCP Toolkit gateway. Runs catalog MCP servers (github, notion, etc.), each
+  isolated in its own container, selected via `DOCKER_MCP_SERVERS` in `.env`.
+  Requires `/var/run/docker.sock` — root-equivalent host access, kept off any
+  published port.
+- Raw `docker ...` CLI commands (build/compose/ps/logs) are run through
+  `ubuntu-controller`'s `execute_command`, not through the gateway. Its image
+  bundles the `docker` CLI and its compose service also bind-mounts
+  `/var/run/docker.sock`.
 
 The gateway uses a single long-lived shared transport per process: new
 clients `initialize` onto the existing session and client session `DELETE`s

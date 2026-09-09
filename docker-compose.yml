@@ -18,6 +18,30 @@ services:
     volumes:
       - /opt:/opt
       - /tmp/metis-jobs:/tmp/metis-jobs
+      # Grants root-equivalent host access (docker.sock) so agents can run
+      # raw `docker ...` commands via execute_command. Requires the image to
+      # be rebuilt with the docker CLI installed (see Dockerfile).
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - metis-network
+    restart: unless-stopped
+
+  # Docker's MCP Toolkit gateway — runs catalog MCP servers (github, notion,
+  # etc.) each in its own isolated container. Needs docker.sock to launch
+  # those containers. Kept internal-only (no host port published).
+  docker-mcp-gateway:
+    image: docker/mcp-gateway
+    container_name: metis-docker-mcp-gateway
+    command:
+      - --transport=streaming
+      - --port=8080
+      - --servers=${DOCKER_MCP_SERVERS:-}
+      - --verbose
+    environment:
+      - DOCKER_MCP_IN_CONTAINER=1
+      - MCP_GATEWAY_AUTH_TOKEN=${MCP_GATEWAY_AUTH_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - metis-network
     restart: unless-stopped
