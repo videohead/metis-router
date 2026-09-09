@@ -151,34 +151,56 @@ app.post('/mcp', async (req, res) => {
       // Connect to the MCP server
       console.log('Connecting to shared MCP server');
       await server.connect(sharedTransport);
-      
-      // Capture the initialize result bytes so later clients can join the session.
+
+      // The SDK answers initialize over SSE, often after handleRequest has
+      // already resolved, so the result must be captured as it is written
+      // rather than by reading the buffer afterwards.
       const initChunks: Buffer[] = [];
       const origWrite = res.write.bind(res);
       const origEnd = res.end.bind(res);
+      const restore = () => {
+        res.write = origWrite as typeof res.write;
+        res.end = origEnd as typeof res.end;
+      };
+      const tryCache = (chunk: unknown) => {
+        if (!chunk || typeof chunk === 'function' || cachedInitResult) {
+          return;
+        }
+        initChunks.push(
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+        );
+        const bodyText = Buffer.concat(initChunks).toString('utf8');
+        for (const line of bodyText.split('\n')) {
+          const raw = line.startsWith('data:') ? line.slice(5).trim() : line.trim();
+          if (!raw.startsWith('{')) {
+            continue;
+          }
+          try {
+            const payload = JSON.parse(raw);
+            if (payload?.result?.capabilities) {
+              cachedInitResult = payload.result;
+              mcpLog('Cached initialize result for shared-session joins');
+              restore();
+              return;
+            }
+          } catch {
+            // Partial chunk; wait for the rest of the stream.
+          }
+        }
+      };
       res.write = ((chunk: unknown, ...rest: unknown[]) => {
-        if (chunk) initChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        tryCache(chunk);
         return (origWrite as any)(chunk, ...rest);
       }) as typeof res.write;
       res.end = ((chunk: unknown, ...rest: unknown[]) => {
-        if (chunk && typeof chunk !== 'function') initChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        tryCache(chunk);
+        restore();
         return (origEnd as any)(chunk, ...rest);
       }) as typeof res.end;
+      res.on('close', restore);
 
       // Handle the initialization request
       await sharedTransport.handleRequest(req, res, req.body);
-
-      try {
-        const bodyText = Buffer.concat(initChunks).toString('utf8');
-        const dataLine = bodyText.split('\n').find((line) => line.startsWith('data:'));
-        const payload = JSON.parse(dataLine ? dataLine.slice(5).trim() : bodyText);
-        if (payload?.result?.capabilities) {
-          cachedInitResult = payload.result;
-          mcpLog('Cached initialize result for shared-session joins');
-        }
-      } catch {
-        mcpLog('Could not cache initialize result; session joins disabled for this transport');
-      }
     } catch (error: any) {
       sharedTransport = null;
       if (error.code === -32001 || error.message?.includes('Unauthorized')) {
@@ -201,6 +223,17 @@ app.post('/mcp', async (req, res) => {
   // For non-initialization requests, use existing transport
   if (sharedTransport) {
     mcpLog(`Using existing shared transport`);
+    // Only one session exists at a time, so a client holding an id from a
+    // previous transport is remapped instead of getting "Session not found".
+    const requestedSessionId = req.headers['mcp-session-id'];
+    if (
+      sharedTransport.sessionId &&
+      typeof requestedSessionId === 'string' &&
+      requestedSessionId !== sharedTransport.sessionId
+    ) {
+      mcpLog(`Remapping stale session ${requestedSessionId} to ${sharedTransport.sessionId}`);
+      req.headers['mcp-session-id'] = sharedTransport.sessionId;
+    }
     try {
       await sharedTransport.handleRequest(req, res, req.body);
     } catch (error: any) {
