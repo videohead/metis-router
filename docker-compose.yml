@@ -13,6 +13,7 @@ services:
     environment:
       # Default umask 007 would make files 700/600. 002 keeps them group-rw.
       - MCP_FILE_UMASK=0002
+      - MCP_SHARED_GID=1005
     command: ["--policy", "dev"]
     volumes:
       - /opt:/opt

@@ -39,9 +39,9 @@ Add the MCP servers you want to `server/mcp-registry.json`. You can add up to **
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://mcp.notion.com/sse"]
     },
-    "openharness": {
-      "url": "http://openharness-mcp:8940/mcp",
-      "description": "OpenHarness agent execution, Qwen3.8-27B coding tools, vector memory, and job tracking"
+    "filesystem": {
+      "url": "http://metis-ubuntu-controller:8765/mcp",
+      "description": "Workspace filesystem and shell controller"
     }
   }
 }

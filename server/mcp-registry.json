@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "openharness": {
-      "url": "http://openharness-mcp:8940/mcp",
-      "description": "OpenHarness agent execution, Qwen3.8-27B coding tools, vector memory, and job tracking"
-    }
-  }
+  "mcpServers": {}
 }
