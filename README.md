@@ -4,6 +4,31 @@ Metis is an advanced AI agent platform with an intelligent MCP (Model Context Pr
 
 ## 🏗️ Architecture
 
+### Local DGX Spark integration
+
+The public chatbot delegates host work to the
+[Agent Framework service](../agent-framework-service/README.md). The harness
+uses LiteLLM for inference and connects directly to `metis-server:9999/mcp`
+for filesystem and system tools. The chatbot's AI SDK executes its own
+application functions; it does not inject LiteLLM MCP gateway tools.
+
+Metis exposes tools as `<server>__<tool>`. The `filesystem__*` routes alias
+the default Ubuntu controller's filesystem tools; a separate filesystem
+upstream is not required. Shell commands run in the controller container,
+whose host access is determined by its mounts and policy, not inside the
+chatbot container.
+
+An `AI_NoSuchToolError` with an empty available-tools list is an application
+tool-registration mismatch, not proof that Metis has no tools. Check
+`http://127.0.0.1:9999/health?detail=true`, initialize an MCP session before
+`tools/list` or `tools/call`, and correlate actual routed tool results.
+Use `filesystem__filesystem_diagnostics` with `probe_write: false` for a
+read-only project check; a writable permission flag does not verify a write.
+
+See the [agent operations guidance](.github/instructions/instructions.md) and
+[cross-service troubleshooting guide](../chatbot/docs/tool-chain-logging.md)
+for local service ports, execution ownership, and verification.
+
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Frontend      │    │   Backend       │    │  MCP Router     │

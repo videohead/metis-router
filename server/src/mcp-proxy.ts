@@ -40,6 +40,22 @@ function mcpLog(message: string) {
   }));
 }
 
+// Structured JSON log for service-level observability. Distinct from mcpLog
+// (which is an MCP log notification shown in client UIs): these lines are for
+// grepping docker logs when tracing a chatbot -> litellm -> metis tool chain.
+function mcpStructuredLog(level: 'info' | 'warn' | 'error', event: string, fields: Record<string, unknown>) {
+  const line = JSON.stringify({
+    event,
+    level,
+    service: 'metis-router',
+    timestamp: new Date().toISOString(),
+    ...fields,
+  });
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
+}
+
 global.EventSource = EventSource as any
 
 export const createServer = async () => {
@@ -57,10 +73,18 @@ export const createServer = async () => {
   const resourceToClientMap = new Map<string, ConnectedClient>();
   const promptToClientMap = new Map<string, ConnectedClient>();
 
-  // Deterministic routing: every routed name is namespaced as "server:name".
-  // Strip any existing "[server] " prefix so double-listing doesn't compound it.
+  // Deterministic routing: every routed name is namespaced as "server__name".
+  // "__" instead of ":" because hosted model APIs (OpenAI, Anthropic) restrict
+  // tool names to ^[a-zA-Z0-9_-]+$; a colon makes every tools-bearing request
+  // fail with a 400. Strip any existing "[server] " prefix so double-listing
+  // doesn't compound it.
   const stripPrefix = (desc: string | undefined) => (desc || '').replace(/^\[[^\]]+\]\s*/, '');
-  const ns = (server: string, name: string) => `${server}:${name}`;
+  const SEPARATOR = '__';
+  const ns = (server: string, name: string) => `${server}${SEPARATOR}${name}`;
+  const parseNs = (name: string) =>
+    name.includes(SEPARATOR)
+      ? name.slice(name.indexOf(SEPARATOR) + SEPARATOR.length)
+      : name;
   const defaultFilesystemServer = 'ubuntu-controller';
   const defaultFilesystemTools = new Set([
     'execute_command',
@@ -88,7 +112,7 @@ export const createServer = async () => {
       description: `[${client.name}] ${stripPrefix(tool.description)}`,
     });
     if (client.name === defaultFilesystemServer && defaultFilesystemTools.has(tool.name)) {
-      const alias = `filesystem:${tool.name}`;
+      const alias = `filesystem${SEPARATOR}${tool.name}`;
       toolToClientMap.set(alias, client);
       allTools.push({
         ...tool,
@@ -536,7 +560,7 @@ export const createServer = async () => {
           refreshErrors[connectedClient.name] = error instanceof Error ? error.message : String(error);
         }
       }
-      const expectedAliases = Array.from(defaultFilesystemTools, tool => `filesystem:${tool}`);
+      const expectedAliases = Array.from(defaultFilesystemTools, tool => `filesystem${SEPARATOR}${tool}`);
       const availableAliases = expectedAliases.filter(tool => toolToClientMap.has(tool));
       return {
         content: [{
@@ -559,9 +583,9 @@ export const createServer = async () => {
       };
     }
 
-    // Resolve "server:tool" (canonical) or a bare name; forward the bare tool name upstream.
+    // Resolve "server__tool" (canonical) or a bare name; forward the bare tool name upstream.
     let clientForTool = toolToClientMap.get(name);
-    const upstreamToolName = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
+    const upstreamToolName = parseNs(name);
 
     if (!clientForTool) {
       console.warn(`Route miss for ${name}; refreshing tools from connected upstreams`);
@@ -586,7 +610,13 @@ export const createServer = async () => {
       throw new Error(`Unknown tool: ${name}. Run mcp_diagnostics to inspect connected servers and default filesystem routes.`);
     }
 
-    console.log(`CallTool request: ${name}; upstream=${clientForTool.name}:${upstreamToolName}; routed=${toolToClientMap.size}`);
+    const toolCallStartedAt = Date.now();
+    mcpStructuredLog('info', 'metis.tool.call.start', {
+      routedName: name,
+      routedToolCount: toolToClientMap.size,
+      upstreamServer: clientForTool.name,
+      upstreamToolName,
+    });
 
     // >>> BEGINNING OF HEATING LOGIC >>> 
     try {
@@ -607,7 +637,7 @@ export const createServer = async () => {
       const currentClient = toolToClientMap.get(name) ?? clientForTool;
       try {
         // Use the correct schema for tool calls
-        return await currentClient.client.request(
+        const result = await currentClient.client.request(
           {
             method: 'tools/call',
             params: {
@@ -620,8 +650,23 @@ export const createServer = async () => {
           },
           CompatibilityCallToolResultSchema
         );
+        mcpStructuredLog('info', 'metis.tool.call.complete', {
+          attempt,
+          durationMs: Date.now() - toolCallStartedAt,
+          routedName: name,
+          upstreamServer: currentClient.name,
+          upstreamToolName,
+        });
+        return result;
       } catch (error: any) {
         lastError = error;
+        mcpStructuredLog('warn', 'metis.tool.call.attempt_failed', {
+          attempt,
+          durationMs: Date.now() - toolCallStartedAt,
+          error: error instanceof Error ? error.message : String(error),
+          routedName: name,
+          upstreamServer: currentClient.name,
+        });
 
         if (isConnectionError(error) && attempt < maxRetries) {
           console.log(`Connection/session error for ${clientForTool.name}, reconnecting (attempt ${attempt + 1}/${maxRetries + 1})...`);
@@ -629,21 +674,57 @@ export const createServer = async () => {
           continue; // loop re-resolves toolToClientMap to the fresh client
         }
 
-        // Not a connection error or retries exhausted: surface it.
+        // Not a connection error or retries exhausted: surface a structured error.
+        mcpStructuredLog('error', 'metis.tool.call.failed', {
+          attempt,
+          durationMs: Date.now() - toolCallStartedAt,
+          error: error instanceof Error ? error.message : String(error),
+          routedName: name,
+          upstreamServer: clientForTool.name,
+        });
         console.error(`Error calling tool through ${clientForTool.name}:`, error);
-        throw error;
+        const isTransient = isConnectionError(error);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: true,
+              tool_name: name,
+              upstream_server: clientForTool.name,
+              reason: error?.message || String(error),
+              transient: isTransient,
+              suggestion: isTransient
+                ? `The upstream MCP server "${clientForTool.name}" is temporarily unreachable. Retry in a moment or run mcp_diagnostics to check server status.`
+                : `Tool call to "${name}" failed on upstream server "${clientForTool.name}". Check the tool arguments and server logs.`,
+            }, null, 2),
+          }],
+          isError: true,
+        };
       }
     }
 
-    // This should never be reached, but just in case
-    throw lastError;
+    // Retries exhausted
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          error: true,
+          tool_name: name,
+          upstream_server: clientForTool.name,
+          reason: lastError?.message || "All retry attempts failed",
+          transient: true,
+          suggestion: `The upstream MCP server "${clientForTool.name}" is unreachable after ${maxRetries + 1} attempts. Run mcp_diagnostics to inspect server status.`,
+        }, null, 2),
+      }],
+      isError: true,
+    };
   });
 
   // Get Prompt Handler
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const { name } = request.params;
     const clientForPrompt = promptToClientMap.get(name);
-    const upstreamPromptName = name.includes(':') ? name.slice(name.indexOf(':') + 1) : name;
+    const upstreamPromptName = parseNs(name);
 
     if (!clientForPrompt) {
       throw new Error(`Unknown prompt: ${name}`);
@@ -771,7 +852,7 @@ export const createServer = async () => {
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     const clientForResource = resourceToClientMap.get(uri);
-    const upstreamUri = uri.includes(':') ? uri.slice(uri.indexOf(':') + 1) : uri;
+    const upstreamUri = parseNs(uri);
 
     if (!clientForResource) {
       throw new Error(`Unknown resource: ${uri}`);
@@ -851,6 +932,33 @@ export const createServer = async () => {
     process.exit(0);
   });
 
-  return { server, cleanup };
+  /** Return per-upstream MCP server health for the /health endpoint. */
+  async function getUpstreamHealth() {
+    const results: Record<string, { connected: boolean; toolCount: number; error?: string }> = {};
+    for (const cc of connectedClients) {
+      try {
+        const toolResult = await cc.client.request(
+          { method: 'tools/list', params: {} },
+          ListToolsResultSchema,
+        );
+        results[cc.name] = { connected: true, toolCount: toolResult.tools?.length ?? 0 };
+      } catch (error) {
+        results[cc.name] = {
+          connected: false,
+          toolCount: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+    // Include configured but disconnected servers
+    for (const sc of config.servers) {
+      if (!(sc.name in results)) {
+        results[sc.name] = { connected: false, toolCount: 0, error: 'not connected' };
+      }
+    }
+    return results;
+  }
+
+  return { server, cleanup, getUpstreamHealth };
 };
 

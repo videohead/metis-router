@@ -81,7 +81,7 @@ app.use((req, res, next) => {
 });
 
 // Create shared MCP server instance
-const { server, cleanup } = await createServer();
+const { server, cleanup, getUpstreamHealth } = await createServer();
 let sharedTransport: StreamableHTTPServerTransport | null = null;
 // Cached initialize result so additional clients can join the shared session
 // instead of resetting it out from under in-flight clients.
@@ -295,11 +295,21 @@ app.delete('/mcp', async (req, res) => {
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  // Include per-upstream server health when ?detail=true is requested
+  const detail = req.query.detail === 'true';
+  const base: Record<string, unknown> = {
+    status: 'ok',
     transportActive: !!sharedTransport,
-    timestamp: new Date().toISOString()
-  });
+    timestamp: new Date().toISOString(),
+  };
+  if (detail) {
+    try {
+      base.upstreams = await getUpstreamHealth();
+    } catch (error) {
+      base.upstreams = { error: 'failed to query upstream health' };
+    }
+  }
+  res.json(base);
 });
 
 // OAuth Protected Resource Metadata endpoint
